@@ -1,0 +1,38 @@
+# virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+.pytest_cache/
+pytest-cache-files-*/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# data
+data/
+handover_data.tar.gz
+
+# outputs / artifacts
+outputs/
+test_artifacts/
+
+# logs
+*.log
+
+# local secrets / env
+.env
+.env.*
+
+# system
+.DS_Store
+Thumbs.db

@@ -1,0 +1,53 @@
+seed: 17
+
+paths:
+  raw_root: data/raw
+  interim_root: data/interim
+  cohort_root: data/interim/cohort
+  trajectory_interim_root: data/interim/trajectories
+  vocab_root: data/interim/vocab
+  processed_root: data/processed
+  ddi_root: data/processed/ddi
+  artifacts_root: data/artifacts
+  encoder_artifact_root: data/artifacts/encoder
+
+  ddi_source_path: data/raw/ddi/drug-DDI.csv
+
+  mimic_prescriptions_path: data/raw/mimiciv/hosp/prescriptions.csv.gz
+  ndc_to_rxcui_path: data/raw/ddi/ndc2RXCUI.txt
+  rxcui_to_atc4_path: data/raw/ddi/RXCUI2atc4.csv
+  drug_atc_path: data/raw/ddi/drug-atc.csv
+
+processed_format: parquet
+
+split:
+  train: 0.7
+  val: 0.15
+  test: 0.15
+
+cohort:
+  require_diagnosis: true
+  require_medication: true
+  min_los_hours: 0.0
+
+features:
+  time_bucket_hours: 24
+  top_k_labs: 64
+  top_k_vitals: 64
+  max_med_history: 32
+  normalization_eps: 1.0e-6
+
+spark:
+  enabled: true
+  master: local[4]
+  driver_memory: 4g
+  default_parallelism: 4
+  sql_shuffle_partitions: 8
+  adaptive_enabled: true
+  adaptive_coalesce_enabled: true
+  files_max_partition_bytes: 64m
+  local_dir: /tmp/healthdm-spark
+  stage_cache_dir: data/interim/spark_cache
+  cache_codec: snappy
+  trajectory_rows_per_file: 8192
+  max_open_shards_per_dataset: 2
