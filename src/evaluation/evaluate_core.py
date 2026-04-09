@@ -373,6 +373,25 @@ def _tune_threshold_on_validation(
     }
 
 
+def _build_target_diagnostics(
+    *,
+    all_targets: torch.Tensor,
+    prediction_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    if all_targets.ndim != 2:
+        raise ValueError(f"Expected evaluation targets with shape (N, D), got {tuple(all_targets.shape)}")
+    if int(all_targets.shape[1]) <= 1:
+        raise ValueError("Evaluation targets must have width > 1 to inspect UNK at index 1.")
+
+    unk_positive_count = float(all_targets[:, 1].sum().item())
+    return {
+        "avg_predicted_drugs": float(prediction_summary["avg_predicted_drugs"]),
+        "avg_true_drugs": float(prediction_summary["avg_true_drugs"]),
+        "unk_positive_count": unk_positive_count,
+        "unk_present_in_targets": bool(unk_positive_count > 0.0),
+    }
+
+
 def run_core_evaluation(
     *,
     model: torch.nn.Module,
@@ -537,6 +556,14 @@ def main() -> None:
             threshold=threshold,
             ddi_matrix=ddi_matrix,
         )
+    diagnostics = _build_target_diagnostics(
+        all_targets=evaluation_result["targets"],
+        prediction_summary=evaluation_result["prediction_summary"],
+    )
+    print(f"Average predicted drugs per patient: {float(diagnostics['avg_predicted_drugs']):.4f}")
+    print(f"Average true drugs per patient: {float(diagnostics['avg_true_drugs']):.4f}")
+    print(f"UNK positive count in targets: {float(diagnostics['unk_positive_count']):.4f}")
+    print(f"UNK present in targets: {bool(diagnostics['unk_present_in_targets'])}")
 
     report: dict[str, Any] = {
         "split": split,
@@ -548,6 +575,7 @@ def main() -> None:
         "metrics": evaluation_result["metrics"],
         "ddi_summary": evaluation_result["ddi_summary"],
         "prediction_summary": evaluation_result["prediction_summary"],
+        "diagnostics": diagnostics,
         "artifacts": {},
     }
     if threshold_tuning_report is not None:

@@ -12,9 +12,9 @@ import pytest
 from src.data.build_cohort import build_cohort
 from src.data.build_ddi_matrix import build_ddi_matrix
 from src.data.build_trajectories import build_trajectories
-from src.data.build_vocab import build_vocab
+from src.data.build_vocab import build_vocab, is_excluded_atc4_code
 from src.data.stage_filtered_tables import stage_filtered_tables
-from src.utils.io import read_csv_gz, read_json, write_json, write_jsonl_gz
+from src.utils.io import iter_jsonl_gz, read_csv_gz, read_json, write_json, write_jsonl_gz
 
 
 def _write_csv_gz(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
@@ -253,7 +253,7 @@ def test_build_vocab_auto_stages_when_spark_enabled(tmp_path: Path) -> None:
     assert (project_root / "data" / "interim" / "vocab" / "diagnosis_vocab.json").exists()
 
 
-def test_build_vocab_filters_drug_tokens_by_atc4_train_frequency_and_artifacts(tmp_path: Path) -> None:
+def test_build_vocab_builds_atc4_level_drug_vocab_from_train_frequency(tmp_path: Path) -> None:
     project_root = _build_mock_project(tmp_path)
     config_path = _write_config(project_root, spark_enabled=False)
 
@@ -261,11 +261,57 @@ def test_build_vocab_filters_drug_tokens_by_atc4_train_frequency_and_artifacts(t
     build_vocab(config_path)
 
     drug_vocab = read_json(project_root / "data" / "interim" / "vocab" / "drug_vocab.json")
-    assert drug_vocab["idx_to_token"] == ["PAD", "UNK", "NAME:ASPIRIN"]
-    assert "NAME:HEPARIN" not in drug_vocab["token_to_idx"]
+    assert drug_vocab["idx_to_token"] == ["PAD", "UNK", "N02BA"]
+    assert "N02BA" in drug_vocab["token_to_idx"]
+    assert "B01AB" not in drug_vocab["token_to_idx"]
+    assert "NAME:ASPIRIN" not in drug_vocab["token_to_idx"]
     assert "NAME:NS_FLUSH" not in drug_vocab["token_to_idx"]
     assert "NAME:STERILE_WATER" not in drug_vocab["token_to_idx"]
     assert "NAME:MYSTERYDRUG" not in drug_vocab["token_to_idx"]
+
+
+def test_atc4_family_filter_excludes_non_core_local_and_support_classes() -> None:
+    assert is_excluded_atc4_code("S01XA")
+    assert is_excluded_atc4_code("S02BA")
+    assert is_excluded_atc4_code("S03AA")
+    assert is_excluded_atc4_code("V04CC")
+    assert is_excluded_atc4_code("V03AB")
+    assert is_excluded_atc4_code("V06DC")
+    assert is_excluded_atc4_code("D07AC")
+    assert not is_excluded_atc4_code("N02BA")
+    assert not is_excluded_atc4_code("C09AA")
+
+
+def test_build_trajectories_maps_medication_targets_to_atc4_ids(tmp_path: Path) -> None:
+    project_root = _build_mock_project(tmp_path)
+    config_path = _write_config(project_root, spark_enabled=False)
+
+    build_cohort(config_path)
+    build_vocab(config_path)
+    outputs = build_trajectories(config_path)
+
+    drug_vocab = read_json(project_root / "data" / "interim" / "vocab" / "drug_vocab.json")
+    aspirin_atc4_id = int(drug_vocab["token_to_idx"]["N02BA"])
+    train_records = list(iter_jsonl_gz(outputs["train"]))
+    assert train_records
+
+    all_target_ids = [
+        int(drug_id)
+        for record in train_records
+        for step in record["steps"]
+        for drug_id in step["target_drugs"]
+    ]
+    all_history_ids = [
+        int(drug_id)
+        for record in train_records
+        for step in record["steps"]
+        for drug_id in step["med_history_ids"]
+    ]
+
+    assert aspirin_atc4_id in all_target_ids
+    assert aspirin_atc4_id in all_history_ids
+    assert 1 not in all_target_ids
+    assert all(drug_id != 1 for drug_id in all_history_ids)
 
 
 def test_data_pipeline_builders_with_spark_cache(tmp_path: Path) -> None:
