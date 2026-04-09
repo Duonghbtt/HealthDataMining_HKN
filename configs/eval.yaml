@@ -16,11 +16,10 @@ runtime:
   batch_size: 32
 
 loss:
-  ddi_lambda: 0.05
+  lambda_ddi: 0.1
 
 prediction:
-  top_k: 10
-  threshold: 0.5
+  threshold: 0.2
 
 evaluation:
   split: test

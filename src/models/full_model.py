@@ -8,7 +8,7 @@ from torch import nn
 
 from src.data.build_vocab import load_vocab_bundle
 from src.data.dataset import MIMICTrajectoryDataset
-from src.models.ddi_regularization import DDIRegularizer
+from src.models.ddi_regularization import load_ddi_matrix
 from src.models.fusion import FusionModule
 from src.models.history_selector import HistorySelector, SelfHistorySelector
 from src.models.medication_decoder import MedicationDecoder
@@ -59,14 +59,14 @@ def _infer_numeric_feature_sizes(data_config_path: str | Path) -> tuple[int, int
     return int(sample.get("lab_feature_size", 0)), int(sample.get("vital_feature_size", 0))
 
 
-def _load_optional_ddi_regularizer(
+def _load_optional_ddi_matrix(
     train_config_path: str | Path | None,
-) -> tuple[DDIRegularizer | None, float]:
+) -> tuple[torch.Tensor | None, float]:
     if train_config_path is None:
         return None, 0.0
 
     train_config = load_yaml_config(train_config_path)
-    lambda_ddi = float(train_config.get("loss", {}).get("ddi_lambda", 0.0))
+    lambda_ddi = float(train_config.get("loss", {}).get("lambda_ddi", 0.0))
     ddi_path_value = train_config.get("paths", {}).get("ddi_matrix_path")
     if not ddi_path_value:
         return None, lambda_ddi
@@ -74,7 +74,7 @@ def _load_optional_ddi_regularizer(
     ddi_path = resolve_path(train_config["_project_root"], ddi_path_value)
     if not ddi_path.exists():
         return None, lambda_ddi
-    return DDIRegularizer(ddi_path, reduction="mean"), lambda_ddi
+    return load_ddi_matrix(ddi_path, device="cpu"), lambda_ddi
 
 
 class FullMedicationModel(nn.Module):
@@ -88,7 +88,7 @@ class FullMedicationModel(nn.Module):
         *,
         medication_decoder: MedicationDecoder | None = None,
         decoder: MedicationDecoder | None = None,
-        ddi_regularizer: DDIRegularizer | None = None,
+        ddi_matrix: torch.Tensor | None = None,
         lambda_ddi: float = 0.0,
         **_: Any,
     ) -> None:
@@ -97,8 +97,11 @@ class FullMedicationModel(nn.Module):
         self.self_history_selector = history_selector
         self.fusion_module = fusion_module
         self.medication_decoder = medication_decoder if medication_decoder is not None else decoder
-        self.ddi_regularizer = ddi_regularizer
         self.lambda_ddi = float(lambda_ddi)
+        if ddi_matrix is None:
+            self.register_buffer("ddi_matrix", None)
+        else:
+            self.register_buffer("ddi_matrix", torch.as_tensor(ddi_matrix, dtype=torch.float32))
 
     @classmethod
     def from_config(
@@ -133,7 +136,7 @@ class FullMedicationModel(nn.Module):
                 "PatientStateEncoder requires matching lab/vital projection widths in the new core pipeline."
             )
 
-        ddi_regularizer, lambda_ddi = _load_optional_ddi_regularizer(train_config_path)
+        ddi_matrix, lambda_ddi = _load_optional_ddi_matrix(train_config_path)
         encoder = PatientStateEncoder(
             diagnosis_vocab_size=len(vocab_bundle["diagnosis"]["idx_to_token"]),
             procedure_vocab_size=len(vocab_bundle["procedure"]["idx_to_token"]),
@@ -168,15 +171,15 @@ class FullMedicationModel(nn.Module):
             history_selector,
             fusion_module,
             medication_decoder=decoder,
-            ddi_regularizer=ddi_regularizer,
+            ddi_matrix=ddi_matrix,
             lambda_ddi=lambda_ddi,
         )
 
-    def _resolve_ddi_regularizer(self, batch: Mapping[str, Any]) -> DDIRegularizer | None:
+    def _resolve_ddi_matrix(self, batch: Mapping[str, Any]) -> torch.Tensor | None:
         ddi_adj = batch.get("ddi_adj")
         if ddi_adj is None:
-            return self.ddi_regularizer
-        return DDIRegularizer(ddi_adj, reduction="mean")
+            return self.ddi_matrix
+        return torch.as_tensor(ddi_adj, dtype=torch.float32)
 
     def forward(self, batch: Mapping[str, Any], **_: Any) -> dict[str, Any]:
         enc_out = self.encoder(dict(batch))
@@ -217,7 +220,7 @@ class FullMedicationModel(nn.Module):
                 drug_probs=dec_out["drug_probs"],
                 target_drugs=target_tensor,
                 visit_mask=visit_mask,
-                ddi_regularizer=self._resolve_ddi_regularizer(batch),
+                ddi_matrix=self._resolve_ddi_matrix(batch),
                 lambda_ddi=self.lambda_ddi,
                 reduction="mean",
             )

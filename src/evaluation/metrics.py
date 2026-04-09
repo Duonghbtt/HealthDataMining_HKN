@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
+import numpy as np
 import torch
+from sklearn.metrics import average_precision_score
 
 
 def _validate_binary_matrix(name: str, value: torch.Tensor) -> torch.Tensor:
@@ -24,6 +24,18 @@ def _validate_same_shape(name_a: str, a: torch.Tensor, name_b: str, b: torch.Ten
 
 def _as_bool_matrix(value: torch.Tensor) -> torch.Tensor:
     return value.to(dtype=torch.bool)
+
+
+def _to_numpy_matrix(name: str, value: torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+    if array.ndim != 2:
+        raise ValueError(f"{name} must have shape (N, D), got {tuple(array.shape)}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return array
 
 
 def _resolve_ddi_upper(ddi_matrix: torch.Tensor) -> torch.Tensor:
@@ -93,46 +105,44 @@ def multilabel_f1(y_true: torch.Tensor, y_pred_binary: torch.Tensor) -> float:
     return float(compute_samplewise_f1(y_true, y_pred_binary).mean().item())
 
 
-def _binary_average_precision(y_true: torch.Tensor, y_score: torch.Tensor) -> float | None:
-    labels = torch.as_tensor(y_true, dtype=torch.float32)
-    scores = torch.as_tensor(y_score, dtype=torch.float32)
-    if labels.ndim != 1 or scores.ndim != 1:
-        raise ValueError(
-            f"Average precision expects 1D tensors, got {tuple(labels.shape)} and {tuple(scores.shape)}"
+def compute_prauc(drug_probs: np.ndarray, y_true: np.ndarray) -> float:
+    """Compute per-patient PRAUC and average over valid patients.
+
+    This project defines PRAUC sample-wise: for each patient/sample, compute
+    average precision over the drug vocabulary, skip samples with no positive
+    labels, and return the mean score across valid patients.
+    """
+
+    probs = _to_numpy_matrix("drug_probs", drug_probs).astype(np.float64, copy=False)
+    labels = _to_numpy_matrix("y_true", y_true).astype(np.float64, copy=False)
+    if probs.shape != labels.shape:
+        raise ValueError(f"drug_probs and y_true must share the same shape, got {probs.shape} and {labels.shape}")
+    if labels.size > 0 and not np.logical_or(labels == 0.0, labels == 1.0).all():
+        raise ValueError("y_true must be a binary matrix with values in {0, 1}")
+    if probs.size > 0:
+        assert probs.min() >= 0.0 and probs.max() <= 1.0, (
+            "drug_probs must be in [0,1] - did you pass logits by mistake?"
         )
-    if labels.shape[0] != scores.shape[0]:
-        raise ValueError(
-            f"Average precision expects aligned shapes, got {tuple(labels.shape)} and {tuple(scores.shape)}"
-        )
 
-    positive_count = int((labels > 0).sum().item())
-    if positive_count <= 0:
-        return None
+    per_sample_scores: list[float] = []
+    for sample_index in range(labels.shape[0]):
+        sample_true = labels[sample_index]
+        if float(sample_true.sum()) <= 0.0:
+            continue
+        per_sample_scores.append(float(average_precision_score(sample_true, probs[sample_index])))
 
-    sorted_indices = torch.argsort(scores, descending=True, stable=True)
-    sorted_labels = (labels[sorted_indices] > 0).to(dtype=torch.float32)
-    cumulative_true_positive = torch.cumsum(sorted_labels, dim=0)
-    ranks = torch.arange(1, sorted_labels.shape[0] + 1, dtype=torch.float32, device=sorted_labels.device)
-    precision_at_k = cumulative_true_positive / ranks
-    average_precision = (precision_at_k * sorted_labels).sum() / float(positive_count)
-    return float(average_precision.item())
-
-
-def multilabel_prauc(y_true: torch.Tensor, y_score: torch.Tensor) -> float:
-    """Macro average precision over drug labels with at least one positive example."""
-
-    true_tensor = _validate_binary_matrix("y_true", y_true)
-    score_tensor = _validate_binary_matrix("y_score", y_score)
-    _validate_same_shape("y_true", true_tensor, "y_score", score_tensor)
-
-    per_label_scores: list[float] = []
-    for label_index in range(true_tensor.shape[1]):
-        ap_score = _binary_average_precision(true_tensor[:, label_index], score_tensor[:, label_index])
-        if ap_score is not None:
-            per_label_scores.append(ap_score)
-    if not per_label_scores:
+    if not per_sample_scores:
         return 0.0
-    return float(sum(per_label_scores) / float(len(per_label_scores)))
+    return float(sum(per_sample_scores) / float(len(per_sample_scores)))
+
+
+def multilabel_prauc(y_true: torch.Tensor | np.ndarray, y_score: torch.Tensor | np.ndarray) -> float:
+    """Compatibility wrapper for per-patient PRAUC computed from probabilities."""
+
+    return compute_prauc(
+        _to_numpy_matrix("drug_probs", y_score),
+        _to_numpy_matrix("y_true", y_true),
+    )
 
 
 def compute_ddi_flags(y_pred_binary: torch.Tensor, ddi_matrix: torch.Tensor) -> torch.Tensor:
@@ -211,7 +221,10 @@ def compute_core_metrics(
     return {
         "jaccard": multilabel_jaccard(y_true, y_pred_binary),
         "f1": multilabel_f1(y_true, y_pred_binary),
-        "prauc": multilabel_prauc(y_true, y_score),
+        "prauc": compute_prauc(
+            _to_numpy_matrix("drug_probs", y_score),
+            _to_numpy_matrix("y_true", y_true),
+        ),
         **ddi_summary,
     }
 
@@ -221,6 +234,7 @@ __all__ = [
     "compute_core_metrics",
     "compute_ddi_flags",
     "compute_ddi_rate",
+    "compute_prauc",
     "compute_samplewise_f1",
     "compute_samplewise_jaccard",
     "multilabel_f1",

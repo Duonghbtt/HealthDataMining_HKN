@@ -37,7 +37,7 @@ else:
     )
 
 from src.models.ddi_regularization import load_ddi_matrix
-from src.training.train_core import build_core_model, resolve_device
+from src.training.runtime_builder import build_core_model, resolve_device
 from src.utils.io import load_yaml_config, read_json, resolve_path, write_json
 
 

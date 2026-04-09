@@ -25,6 +25,8 @@ def test_medication_decoder_forward_shapes_and_probabilities(fused_repr: torch.T
         drug_vocab_size=6,
         dropout=0.0,
     )
+    assert hasattr(decoder, "proj")
+    assert hasattr(decoder, "fc")
 
     outputs = decoder(context_vector=fused_repr)
 
@@ -34,3 +36,4 @@ def test_medication_decoder_forward_shapes_and_probabilities(fused_repr: torch.T
     assert torch.isfinite(outputs["drug_probs"]).all()
     assert torch.all(outputs["drug_probs"] >= 0.0)
     assert torch.all(outputs["drug_probs"] <= 1.0)
+    assert torch.allclose(outputs["drug_probs"], torch.sigmoid(outputs["drug_logits"]))

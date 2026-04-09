@@ -21,7 +21,7 @@ optimization:
   scheduler: none
 
 loss:
-  ddi_lambda: 0.05
+  lambda_ddi: 0.1
 
 prediction:
   top_k: 10

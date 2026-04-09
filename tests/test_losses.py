@@ -5,8 +5,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from src.models.ddi_regularization import DDIRegularizer
-from src.training.losses import compute_medication_losses, extract_last_valid_targets
+import src.training.losses as losses_module
+from src.training.losses import MedicationRecommendationLoss, compute_medication_losses, extract_last_valid_targets
 
 
 def test_extract_last_valid_targets_uses_last_valid_visit() -> None:
@@ -46,6 +46,7 @@ def test_compute_medication_losses_returns_all_components() -> None:
             [-0.4, 0.7, 0.3],
         ],
         dtype=torch.float32,
+        requires_grad=True,
     )
     targets = torch.tensor(
         [
@@ -66,16 +67,103 @@ def test_compute_medication_losses_returns_all_components() -> None:
         drug_logits=logits,
         target_drugs=targets,
         visit_mask=visit_mask,
-        ddi_regularizer=DDIRegularizer(ddi_adj, reduction="mean"),
-        lambda_ddi=0.05,
+        ddi_matrix=ddi_adj,
+        lambda_ddi=0.1,
     )
+    drug_probs = torch.sigmoid(logits)
+    expected_ddi_loss = (
+        (drug_probs.unsqueeze(2) * drug_probs.unsqueeze(1)) * ddi_adj.unsqueeze(0)
+    ).sum(dim=(1, 2)).mean()
 
     assert loss_outputs["target_current"].shape == (2, 3)
     assert torch.isfinite(loss_outputs["prediction_loss"])
     assert torch.isfinite(loss_outputs["ddi_loss"])
     assert torch.isfinite(loss_outputs["weighted_ddi_loss"])
     assert torch.isfinite(loss_outputs["total_loss"])
+    assert torch.allclose(loss_outputs["ddi_loss"], expected_ddi_loss)
     assert torch.allclose(
         loss_outputs["total_loss"],
-        loss_outputs["prediction_loss"] + loss_outputs["weighted_ddi_loss"],
+        loss_outputs["prediction_loss"] + 0.1 * loss_outputs["ddi_loss"],
     )
+
+
+def test_compute_medication_losses_builds_pos_weight_from_avg_pos() -> None:
+    logits = torch.tensor(
+        [
+            [0.4, -0.1, 0.2],
+            [-0.3, 0.8, 0.1],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    targets = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    expected_pos_weight = torch.full((3,), 2.0, dtype=torch.float32)
+
+    loss_from_avg_pos = compute_medication_losses(
+        drug_logits=logits,
+        target_drugs=targets,
+        avg_pos=1.0,
+        reduction="mean",
+    )
+    loss_from_explicit_weight = compute_medication_losses(
+        drug_logits=logits,
+        target_drugs=targets,
+        pos_weight=expected_pos_weight,
+        reduction="mean",
+    )
+
+    assert torch.allclose(
+        loss_from_avg_pos["prediction_loss"],
+        loss_from_explicit_weight["prediction_loss"],
+    )
+
+
+def test_compute_medication_losses_rejects_mismatched_drug_probs() -> None:
+    logits = torch.tensor([[0.2, -0.4, 0.7]], dtype=torch.float32, requires_grad=True)
+    targets = torch.tensor([[1.0, 0.0, 1.0]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="drug_probs must match torch.sigmoid\\(drug_logits\\)"):
+        compute_medication_losses(
+            drug_logits=logits,
+            target_drugs=targets,
+            drug_probs=torch.tensor([[0.1, 0.1, 0.1]], dtype=torch.float32),
+        )
+
+
+def test_compute_medication_losses_asserts_on_non_grad_logits_during_training() -> None:
+    logits = torch.tensor([[0.2, -0.4, 0.7]], dtype=torch.float32)
+    targets = torch.tensor([[1.0, 0.0, 1.0]], dtype=torch.float32)
+
+    with pytest.raises(AssertionError, match="drug_logits must be raw logits"):
+        compute_medication_losses(
+            drug_logits=logits,
+            target_drugs=targets,
+        )
+
+    loss_outputs = compute_medication_losses(
+        drug_logits=logits,
+        target_drugs=targets,
+        training=False,
+    )
+    assert torch.isfinite(loss_outputs["prediction_loss"])
+
+
+def test_medication_recommendation_loss_warns_when_lambda_ddi_is_zero(capsys: pytest.CaptureFixture[str]) -> None:
+    losses_module._LAMBDA_DDI_DISABLED_WARNING_SHOWN = False
+    criterion = MedicationRecommendationLoss(lambda_ddi=0.0)
+    logits = torch.tensor([[0.2, -0.4, 0.7]], dtype=torch.float32, requires_grad=True)
+    targets = torch.tensor([[1.0, 0.0, 1.0]], dtype=torch.float32)
+
+    criterion(
+        drug_logits=logits,
+        target_drugs=targets,
+    )
+    captured = capsys.readouterr()
+
+    assert "WARNING: lambda_ddi=0, DDI loss is disabled. DDI rate will not be optimized." in captured.out

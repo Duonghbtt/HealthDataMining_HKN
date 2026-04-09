@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import copy
-import random
-import tempfile
 from bisect import bisect_right
 from collections import OrderedDict
 from pathlib import Path
@@ -25,8 +22,6 @@ from src.models.fusion import FusionModule
 from src.models.history_selector import SelfHistorySelector
 from src.models.medication_decoder import MedicationDecoder
 from src.models.patient_state_encoder import PatientStateEncoder
-from src.training import runtime_builder
-from src.training.trainer import Trainer
 from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path
 
 
@@ -150,49 +145,12 @@ class DirectParquetTrajectoryDataset(Dataset):
         return dict(self._load_shard(shard_index)[local_index])
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the core ClinRec recommendation model.")
-    parser.add_argument("--config", default="configs/train.yaml", help="Path to configs/train.yaml")
-    parser.add_argument("--data-config", default="configs/data.yaml", help="Path to configs/data.yaml")
-    parser.add_argument("--model-config", default="configs/model.yaml", help="Path to configs/model.yaml")
-    parser.add_argument("--processed-root", default=None, help="Optional override for processed data root")
-    parser.add_argument("--vocab-root", default=None, help="Optional override for vocab directory")
-    parser.add_argument("--ddi-matrix-path", default=None, help="Optional override for DDI matrix artifact")
-    parser.add_argument("--device", default=None, help="Optional override for runtime device")
-    parser.add_argument("--seed", type=int, default=None, help="Optional override for random seed")
-    return parser.parse_args()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def resolve_device(requested_device: str) -> torch.device:
     device = torch.device(str(requested_device))
     if device.type == "cuda" and not torch.cuda.is_available():
         print("Requested CUDA but it is not available; falling back to CPU.")
         return torch.device("cpu")
     return device
-
-
-def _first_existing_path(
-    candidates: Sequence[Path | None],
-    *,
-    kind: str,
-) -> Path:
-    checked: list[str] = []
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        checked.append(str(candidate))
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        f"Unable to resolve {kind}. Checked candidates: {checked if checked else ['<none>']}"
-    )
 
 
 def _runtime_cache_size(runtime_data_config_path: Path) -> int:
@@ -238,62 +196,6 @@ def select_collate_fn(dataset: Dataset):
     if isinstance(dataset, TensorizedTrajectoryDataset) or _dataset_storage_mode(dataset) == "tensorized_pt":
         return tensorized_collate_batch
     return collate_batch
-
-
-def resolve_runtime_paths(
-    *,
-    project_root: Path,
-    train_config: Mapping[str, Any],
-    data_config: Mapping[str, Any],
-    args: argparse.Namespace,
-) -> dict[str, Path]:
-    train_paths = dict(train_config.get("paths", {}))
-    data_paths = dict(data_config.get("paths", {}))
-
-    processed_root = _first_existing_path(
-        [
-            None if args.processed_root is None else Path(args.processed_root).resolve(),
-            None if train_paths.get("processed_root") is None else resolve_path(project_root, train_paths["processed_root"]).resolve(),
-            None if data_paths.get("processed_root") is None else resolve_path(project_root, data_paths["processed_root"]).resolve(),
-            (project_root / "handover_data" / "processed").resolve(),
-        ],
-        kind="processed_root",
-    )
-    vocab_root = _first_existing_path(
-        [
-            None if args.vocab_root is None else Path(args.vocab_root).resolve(),
-            None if train_paths.get("vocab_root") is None else resolve_path(project_root, train_paths["vocab_root"]).resolve(),
-            None if data_paths.get("interim_root") is None else (resolve_path(project_root, data_paths["interim_root"]).resolve() / "vocab"),
-            (project_root / "handover_data" / "vocab").resolve(),
-        ],
-        kind="vocab_root",
-    )
-    ddi_matrix_path = _first_existing_path(
-        [
-            None if args.ddi_matrix_path is None else Path(args.ddi_matrix_path).resolve(),
-            None if train_paths.get("ddi_matrix_path") is None else resolve_path(project_root, train_paths["ddi_matrix_path"]).resolve(),
-            (project_root / "handover_data" / "processed" / "ddi" / "drug_ddi.pt").resolve(),
-        ],
-        kind="ddi_matrix_path",
-    )
-
-    checkpoint_dir = ensure_dir(resolve_path(project_root, train_paths.get("checkpoint_dir", "outputs/checkpoints")).resolve())
-    log_dir = ensure_dir(resolve_path(project_root, train_paths.get("log_dir", "outputs/logs")).resolve())
-
-    print("Resolved runtime paths:")
-    print(f"  processed_root: {processed_root}")
-    print(f"  vocab_root: {vocab_root}")
-    print(f"  ddi_matrix_path: {ddi_matrix_path}")
-    print(f"  checkpoint_dir: {checkpoint_dir}")
-    print(f"  log_dir: {log_dir}")
-
-    return {
-        "processed_root": processed_root,
-        "vocab_root": vocab_root,
-        "ddi_matrix_path": ddi_matrix_path,
-        "checkpoint_dir": checkpoint_dir,
-        "log_dir": log_dir,
-    }
 
 
 def build_runtime_data_config_file(
@@ -346,7 +248,9 @@ def build_dataset(
     drug_vocab_size: int,
     dataset_cache_size: int | None = None,
 ) -> Dataset:
-    resolved_dataset_cache_size = int(dataset_cache_size if dataset_cache_size is not None else _runtime_cache_size(runtime_data_config_path))
+    resolved_dataset_cache_size = int(
+        dataset_cache_size if dataset_cache_size is not None else _runtime_cache_size(runtime_data_config_path)
+    )
     runtime_config = load_yaml_config(runtime_data_config_path)
     tensorized_manifest_path = tensorized_manifest_path_from_config(runtime_config)
     if tensorized_manifest_path.exists():
@@ -569,104 +473,12 @@ def build_core_model(
     )
 
 
-def build_optimizer(*, model: torch.nn.Module, train_config: Mapping[str, Any]) -> torch.optim.Optimizer:
-    optimization_cfg = dict(train_config.get("optimization", {}))
-    optimizer_name = str(optimization_cfg.get("optimizer", "adam")).strip().lower()
-    if optimizer_name != "adam":
-        raise ValueError(f"Unsupported optimizer `{optimizer_name}`. Only `adam` is supported in train_core.py.")
-    learning_rate = float(optimization_cfg.get("learning_rate", 1.0e-3))
-    return torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-
-def build_scheduler(*, optimizer: torch.optim.Optimizer, train_config: Mapping[str, Any]) -> Any | None:
-    scheduler_name = str(train_config.get("optimization", {}).get("scheduler", "none")).strip().lower()
-    if scheduler_name != "none":
-        raise ValueError(f"Unsupported scheduler `{scheduler_name}`. Only `none` is supported in train_core.py.")
-    _ = optimizer
-    return None
-
-
-def main() -> None:
-    args = parse_args()
-    train_config = load_yaml_config(args.config)
-    data_config = load_yaml_config(args.data_config)
-    model_config = load_yaml_config(args.model_config)
-
-    project_root = Path(train_config["_project_root"]).resolve()
-    resolved_paths = resolve_runtime_paths(
-        project_root=project_root,
-        train_config=train_config,
-        data_config=data_config,
-        args=args,
-    )
-
-    runtime_cfg = dict(train_config.get("runtime", {}))
-    device = runtime_builder.resolve_device(args.device or runtime_cfg.get("device", "cpu"))
-    seed = int(args.seed if args.seed is not None else data_config.get("seed", 17))
-    num_workers = int(runtime_cfg.get("num_workers", 0))
-    pin_memory = bool(runtime_cfg.get("pin_memory", device.type == "cuda"))
-    set_seed(seed)
-
-    print(f"Using device: {device}")
-    print(f"Using seed: {seed}")
-
-    with tempfile.TemporaryDirectory(prefix="clinrec_runtime_") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        runtime_data_config_path = runtime_builder.build_runtime_data_config_file(
-            project_root=project_root,
-            data_config=data_config,
-            processed_root=resolved_paths["processed_root"],
-            vocab_root=resolved_paths["vocab_root"],
-            temp_dir=temp_dir,
-        )
-        drug_vocab_size = int(read_json(resolved_paths["vocab_root"] / "drug_vocab.json")["size"])
-
-        train_loader, val_loader, train_dataset = runtime_builder.build_dataloaders(
-            runtime_data_config_path=runtime_data_config_path,
-            processed_root=resolved_paths["processed_root"],
-            drug_vocab_size=drug_vocab_size,
-            batch_size=int(runtime_cfg.get("batch_size", 16)),
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
-        model = runtime_builder.build_core_model(
-            train_config=train_config,
-            model_config=model_config,
-            train_dataset=train_dataset,
-            vocab_root=resolved_paths["vocab_root"],
-            ddi_matrix_path=resolved_paths["ddi_matrix_path"],
-        )
-
-    optimizer = build_optimizer(model=model, train_config=train_config)
-    scheduler = build_scheduler(optimizer=optimizer, train_config=train_config)
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        checkpoint_dir=resolved_paths["checkpoint_dir"],
-        log_dir=resolved_paths["log_dir"],
-        monitor_metric="val_total_loss",
-        monitor_mode="min",
-        validation_threshold=float(train_config.get("prediction", {}).get("threshold", 0.5)),
-    )
-
-    fit_result = trainer.fit(
-        train_dataloader=train_loader,
-        val_dataloader=val_loader,
-        epochs=int(train_config.get("optimization", {}).get("epochs", 10)),
-        extra_checkpoint_state={
-            "train_config": {key: value for key, value in train_config.items() if not str(key).startswith("_")},
-            "data_config": {key: value for key, value in data_config.items() if not str(key).startswith("_")},
-            "model_config": {key: value for key, value in model_config.items() if not str(key).startswith("_")},
-            "resolved_paths": {key: str(value) for key, value in resolved_paths.items()},
-            "seed": seed,
-        },
-    )
-
-    print(f"Best checkpoint: {fit_result['best_checkpoint_path']}")
-    print(f"Monitor metric: {fit_result['monitor_metric']} (best={fit_result['best_metric']:.6f})")
-
-
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "DirectParquetTrajectoryDataset",
+    "build_core_model",
+    "build_dataloaders",
+    "build_dataset",
+    "build_runtime_data_config_file",
+    "resolve_device",
+    "select_collate_fn",
+]

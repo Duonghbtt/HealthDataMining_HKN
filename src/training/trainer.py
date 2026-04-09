@@ -10,6 +10,9 @@ from torch import nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
+from src.evaluation.metrics import compute_core_metrics
+from src.training.losses import extract_last_valid_targets
+
 try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover - optional progress dependency
@@ -67,9 +70,12 @@ class Trainer:
         monitor_mode: str = "min",
         decoder_top_k: int | None = None,
         loss_fn: nn.Module | None = None,
+        validation_threshold: float = 0.5,
     ) -> None:
         if monitor_mode not in {"min", "max"}:
             raise ValueError(f"monitor_mode must be 'min' or 'max', got {monitor_mode!r}")
+        if not 0.0 <= float(validation_threshold) <= 1.0:
+            raise ValueError(f"validation_threshold must be in [0, 1], got {validation_threshold!r}")
 
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -79,12 +85,42 @@ class Trainer:
         self.monitor_mode = str(monitor_mode)
         self.decoder_top_k = decoder_top_k
         self.loss_fn = loss_fn
+        self.validation_threshold = float(validation_threshold)
 
         self.checkpoint_dir = ensure_dir(checkpoint_dir)
         self.log_dir = ensure_dir(log_dir)
         self.best_checkpoint_path = self.checkpoint_dir / "train_core_best.pt"
         self.metrics_log_path = self.log_dir / "train_core_metrics.jsonl"
         self.best_metric = float("inf") if monitor_mode == "min" else float("-inf")
+
+    def _resolve_validation_ddi_matrix(self, batch: Mapping[str, Any]) -> torch.Tensor | None:
+        ddi_matrix = batch.get("ddi_adj")
+        if ddi_matrix is None:
+            ddi_matrix = getattr(self.model, "ddi_matrix", None)
+        if ddi_matrix is None:
+            return None
+
+        resolved = torch.as_tensor(ddi_matrix, dtype=torch.float32).detach().cpu()
+        if resolved.ndim != 2:
+            raise ValueError(f"Validation ddi_matrix must have shape (D, D), got {tuple(resolved.shape)}")
+        return resolved
+
+    def _resolve_validation_targets(
+        self,
+        outputs: Mapping[str, Any],
+        batch: Mapping[str, Any],
+    ) -> torch.Tensor | None:
+        target_current = outputs.get("final_target_drugs")
+        if target_current is None:
+            target_current = outputs.get("target_current")
+        if target_current is None:
+            target_current = batch.get("target_drugs")
+            if isinstance(target_current, torch.Tensor) and target_current.ndim == 3:
+                visit_mask = batch.get("visit_mask")
+                if not isinstance(visit_mask, torch.Tensor):
+                    raise RuntimeError("visit_mask is required to resolve validation targets from [B, T, D].")
+                target_current = extract_last_valid_targets(target_current, visit_mask)
+        return None if target_current is None else torch.as_tensor(target_current)
 
     def _run_one_epoch(
         self,
@@ -97,6 +133,9 @@ class Trainer:
         timing_totals = {key: 0.0 for key in _TIME_KEYS}
         total_examples = 0
         total_batches = 0
+        collected_probs: list[torch.Tensor] = []
+        collected_targets: list[torch.Tensor] = []
+        validation_ddi_matrix: torch.Tensor | None = None
 
         self.model.train(mode=training)
         grad_context = torch.enable_grad if training else torch.no_grad
@@ -137,6 +176,22 @@ class Trainer:
                         "Model forward must return `total_loss`, `prediction_loss`, and `ddi_loss` "
                         "for the new training pipeline."
                     )
+                if not training:
+                    drug_probs = outputs.get("drug_probs")
+                    target_current = self._resolve_validation_targets(outputs, batch_on_device)
+                    if drug_probs is None or target_current is None:
+                        raise RuntimeError(
+                            "Model forward must return `drug_probs` and current-visit targets for validation metrics."
+                        )
+                    collected_probs.append(drug_probs.detach().cpu())
+                    collected_targets.append(target_current.detach().cpu())
+                    batch_ddi_matrix = self._resolve_validation_ddi_matrix(batch_on_device)
+                    if batch_ddi_matrix is None:
+                        raise RuntimeError("Validation metrics require an available ddi_matrix.")
+                    if validation_ddi_matrix is None:
+                        validation_ddi_matrix = batch_ddi_matrix
+                    elif not torch.equal(validation_ddi_matrix, batch_ddi_matrix):
+                        raise ValueError("Validation batches produced inconsistent ddi_matrix values.")
 
                 if training:
                     total_loss.backward()
@@ -167,6 +222,23 @@ class Trainer:
         metrics = {f"{phase}_{key}": totals[key] / float(total_examples) for key in _LOSS_KEYS}
         average_batches = float(max(total_batches, 1))
         metrics.update({f"{phase}_{key}": timing_totals[key] / average_batches for key in _TIME_KEYS})
+        if not training:
+            if not collected_probs or not collected_targets or validation_ddi_matrix is None:
+                raise ValueError("Validation epoch did not produce metric inputs")
+            validation_metrics = compute_core_metrics(
+                y_true=torch.cat(collected_targets, dim=0),
+                y_score=torch.cat(collected_probs, dim=0),
+                threshold=self.validation_threshold,
+                ddi_matrix=validation_ddi_matrix,
+            )
+            metrics.update(
+                {
+                    "val_jaccard": float(validation_metrics["jaccard"]),
+                    "val_f1": float(validation_metrics["f1"]),
+                    "val_prauc": float(validation_metrics["prauc"]),
+                    "val_ddi_rate": float(validation_metrics["ddi_rate"]),
+                }
+            )
         return metrics
 
     def train_one_epoch(self, dataloader: DataLoader) -> dict[str, float]:
@@ -226,6 +298,10 @@ class Trainer:
             f"val_total_loss={float(metrics['val_total_loss']):.6f} "
             f"val_prediction_loss={float(metrics['val_prediction_loss']):.6f} "
             f"val_ddi_loss={float(metrics['val_ddi_loss']):.6f} "
+            f"val_jaccard={float(metrics['val_jaccard']):.6f} "
+            f"val_f1={float(metrics['val_f1']):.6f} "
+            f"val_prauc={float(metrics['val_prauc']):.6f} "
+            f"val_ddi_rate={float(metrics['val_ddi_rate']):.6f} "
             f"val_data_time={float(metrics['val_data_time']):.3f}s "
             f"val_step_time={float(metrics['val_step_time']):.3f}s "
             f"bottleneck={bottleneck}"
@@ -277,7 +353,8 @@ class Trainer:
                 epoch_progress.set_postfix(
                     train_total=f"{float(epoch_metrics['train_total_loss']):.4f}",
                     val_total=f"{float(epoch_metrics['val_total_loss']):.4f}",
-                    val_ddi=f"{float(epoch_metrics['val_ddi_loss']):.4f}",
+                    val_jac=f"{float(epoch_metrics['val_jaccard']):.4f}",
+                    val_ddi=f"{float(epoch_metrics['val_ddi_rate']):.4f}",
                     data=f"{float(epoch_metrics['train_data_time']):.3f}s",
                     step=f"{float(epoch_metrics['train_step_time']):.3f}s",
                 )

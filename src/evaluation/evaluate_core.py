@@ -33,7 +33,7 @@ else:
     )
 
 from src.models.ddi_regularization import load_ddi_matrix
-from src.training.train_core import (
+from src.training.runtime_builder import (
     build_core_model,
     build_dataset,
     build_runtime_data_config_file,
@@ -41,6 +41,8 @@ from src.training.train_core import (
     select_collate_fn,
 )
 from src.utils.io import ensure_dir, load_yaml_config, read_json, resolve_path, write_json
+
+THRESHOLD_CANDIDATES: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-config", default=None, help="Optional override for configs/train.yaml")
     parser.add_argument("--checkpoint", default=None, help="Optional override for best checkpoint path")
     parser.add_argument("--split", default=None, help="Optional override for evaluation split")
-    parser.add_argument("--threshold", type=float, default=None, help="Optional override for prediction threshold")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Optional override for prediction threshold; skips validation threshold tuning",
+    )
     parser.add_argument("--device", default=None, help="Optional override for runtime device")
     parser.add_argument("--processed-root", default=None, help="Optional override for processed data root")
     parser.add_argument("--vocab-root", default=None, help="Optional override for vocab directory")
@@ -235,13 +242,11 @@ def build_eval_dataloader(
     )
 
 
-def run_core_evaluation(
+def _collect_core_outputs(
     *,
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    threshold: float,
-    ddi_matrix: torch.Tensor,
 ) -> dict[str, Any]:
     collected_probs: list[torch.Tensor] = []
     collected_targets: list[torch.Tensor] = []
@@ -273,8 +278,27 @@ def run_core_evaluation(
     if not collected_probs or not collected_targets:
         raise ValueError("Evaluation dataloader produced no batches")
 
-    all_probs = torch.cat(collected_probs, dim=0)
-    all_targets = torch.cat(collected_targets, dim=0)
+    return {
+        "drug_probs": torch.cat(collected_probs, dim=0),
+        "targets": torch.cat(collected_targets, dim=0),
+        "subject_ids": subject_ids,
+        "hadm_ids": hadm_ids,
+        "stay_ids": stay_ids,
+    }
+
+
+def _summarize_core_evaluation(
+    *,
+    collected_outputs: Mapping[str, Any],
+    threshold: float,
+    ddi_matrix: torch.Tensor,
+) -> dict[str, Any]:
+    all_probs = collected_outputs["drug_probs"]
+    all_targets = collected_outputs["targets"]
+    subject_ids = [int(value) for value in collected_outputs.get("subject_ids", [])]
+    hadm_ids = [int(value) for value in collected_outputs.get("hadm_ids", [])]
+    stay_ids = [int(value) for value in collected_outputs.get("stay_ids", [])]
+
     binary_predictions = binarize_predictions(all_probs, threshold).cpu()
     ddi_matrix_cpu = ddi_matrix.detach().cpu()
 
@@ -328,6 +352,47 @@ def run_core_evaluation(
     }
 
 
+def _tune_threshold_on_validation(
+    *,
+    drug_probs: torch.Tensor,
+    y_true: torch.Tensor,
+) -> dict[str, float]:
+    best_threshold = float(THRESHOLD_CANDIDATES[0])
+    best_jaccard = float("-inf")
+
+    for threshold in THRESHOLD_CANDIDATES:
+        y_pred_binary = binarize_predictions(drug_probs, threshold)
+        jaccard = float(compute_samplewise_jaccard(y_true, y_pred_binary).mean().item())
+        if jaccard > best_jaccard:
+            best_threshold = float(threshold)
+            best_jaccard = float(jaccard)
+
+    return {
+        "best_threshold": best_threshold,
+        "best_jaccard": best_jaccard,
+    }
+
+
+def run_core_evaluation(
+    *,
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    threshold: float,
+    ddi_matrix: torch.Tensor,
+) -> dict[str, Any]:
+    collected_outputs = _collect_core_outputs(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+    )
+    return _summarize_core_evaluation(
+        collected_outputs=collected_outputs,
+        threshold=threshold,
+        ddi_matrix=ddi_matrix,
+    )
+
+
 def main() -> None:
     args = parse_args()
     eval_config = load_yaml_config(args.config)
@@ -366,10 +431,9 @@ def main() -> None:
 
     runtime_cfg = dict(eval_config.get("runtime", {}))
     evaluation_cfg = dict(eval_config.get("evaluation", {}))
-    prediction_cfg = dict(eval_config.get("prediction", {}))
 
     split = str(args.split or evaluation_cfg.get("split", "test"))
-    threshold = float(args.threshold if args.threshold is not None else prediction_cfg.get("threshold", 0.5))
+    threshold_override = float(args.threshold) if args.threshold is not None else None
     device = resolve_device(args.device or runtime_cfg.get("device", "cpu"))
     batch_size = int(runtime_cfg.get("batch_size", 32))
 
@@ -383,7 +447,6 @@ def main() -> None:
 
     print(f"Using device: {device}")
     print(f"Evaluating split: {split}")
-    print(f"Using threshold: {threshold}")
     print(f"Loading checkpoint: {checkpoint_path}")
 
     with tempfile.TemporaryDirectory(prefix="clinrec_eval_runtime_") as temp_dir_name:
@@ -396,12 +459,23 @@ def main() -> None:
             temp_dir=temp_dir,
         )
 
-        dataloader = build_eval_dataloader(
-            split=split,
+        val_dataloader = build_eval_dataloader(
+            split="val",
             runtime_data_config_path=runtime_data_config_path,
             processed_root=resolved_paths["processed_root"],
             drug_vocab_size=drug_vocab_size,
             batch_size=batch_size,
+        )
+        dataloader = (
+            val_dataloader
+            if split == "val"
+            else build_eval_dataloader(
+                split=split,
+                runtime_data_config_path=runtime_data_config_path,
+                processed_root=resolved_paths["processed_root"],
+                drug_vocab_size=drug_vocab_size,
+                batch_size=batch_size,
+            )
         )
         model = build_core_model(
             train_config=train_config,
@@ -417,18 +491,58 @@ def main() -> None:
         raise KeyError("Checkpoint does not contain `model_state_dict`.")
     model.load_state_dict(model_state_dict, strict=True)
 
-    evaluation_result = run_core_evaluation(
-        model=model,
-        dataloader=dataloader,
-        device=device,
-        threshold=threshold,
-        ddi_matrix=ddi_matrix,
-    )
+    threshold = threshold_override
+    threshold_source = "cli_override" if threshold_override is not None else "validation_tuning"
+    threshold_tuning_report: dict[str, Any] | None = None
+    threshold_tuning_artifact_path: Path | None = None
+    val_outputs: dict[str, Any] | None = None
+
+    if threshold is None:
+        val_outputs = _collect_core_outputs(
+            model=model,
+            dataloader=val_dataloader,
+            device=device,
+        )
+        tuning_result = _tune_threshold_on_validation(
+            drug_probs=val_outputs["drug_probs"],
+            y_true=val_outputs["targets"],
+        )
+        threshold = float(tuning_result["best_threshold"])
+        threshold_tuning_report = {
+            "tuned_on_split": "val",
+            "used_for_split": split,
+            "best_threshold": float(tuning_result["best_threshold"]),
+            "best_jaccard": float(tuning_result["best_jaccard"]),
+            "candidate_thresholds": [float(value) for value in THRESHOLD_CANDIDATES],
+        }
+        print(f"Best threshold on val: {threshold:.2f}, val Jaccard: {float(tuning_result['best_jaccard']):.4f}")
+        threshold_tuning_artifact_path = write_json(
+            resolved_paths["report_dir"] / f"evaluate_core_{split}_threshold_tuning.json",
+            threshold_tuning_report,
+        )
+
+    print(f"Using threshold: {threshold:.2f}")
+
+    if split == "val" and val_outputs is not None:
+        evaluation_result = _summarize_core_evaluation(
+            collected_outputs=val_outputs,
+            threshold=threshold,
+            ddi_matrix=ddi_matrix,
+        )
+    else:
+        evaluation_result = run_core_evaluation(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            threshold=threshold,
+            ddi_matrix=ddi_matrix,
+        )
 
     report: dict[str, Any] = {
         "split": split,
         "num_samples": int(evaluation_result["targets"].shape[0]),
-        "threshold": threshold,
+        "threshold": float(threshold),
+        "threshold_source": threshold_source,
         "checkpoint_path": str(checkpoint_path),
         "device": str(device),
         "metrics": evaluation_result["metrics"],
@@ -436,6 +550,10 @@ def main() -> None:
         "prediction_summary": evaluation_result["prediction_summary"],
         "artifacts": {},
     }
+    if threshold_tuning_report is not None:
+        report["threshold_tuning"] = threshold_tuning_report
+    if threshold_tuning_artifact_path is not None:
+        report["artifacts"]["threshold_tuning_json"] = str(threshold_tuning_artifact_path)
 
     save_reports = bool(evaluation_cfg.get("save_reports", True))
     save_predictions = bool(evaluation_cfg.get("save_predictions", True))

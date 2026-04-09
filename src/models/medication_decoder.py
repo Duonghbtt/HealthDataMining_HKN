@@ -13,7 +13,15 @@ def _validate_positive_int(name: str, value: int) -> int:
 
 
 class MedicationDecoder(nn.Module):
-    """Decode a fused context vector into medication logits and probabilities."""
+    """Decode a fused context vector into medication logits and probabilities.
+
+    Outputs
+    -------
+    drug_logits:
+        Raw pre-sigmoid scores used as input to ``BCEWithLogitsLoss``.
+    drug_probs:
+        ``torch.sigmoid(drug_logits)`` in ``[0, 1]``, used for metrics and thresholding.
+    """
 
     def __init__(
         self,
@@ -29,14 +37,16 @@ class MedicationDecoder(nn.Module):
         if not 0.0 <= float(dropout) <= 1.0:
             raise ValueError(f"dropout must be in [0, 1], got {dropout!r}")
 
-        self.decoder = nn.Sequential(
+        self.proj = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(float(dropout)),
-            nn.Linear(self.hidden_dim, self.drug_vocab_size),
         )
+        self.fc = nn.Linear(self.hidden_dim, self.drug_vocab_size)
 
     def forward(self, context_vector: torch.Tensor, **_: Any) -> dict[str, torch.Tensor]:
+        """Return raw medication logits plus sigmoid probabilities for inference helpers."""
+
         if not isinstance(context_vector, torch.Tensor):
             raise TypeError(f"context_vector must be a torch.Tensor, got {type(context_vector)!r}")
         if context_vector.ndim != 2:
@@ -47,8 +57,9 @@ class MedicationDecoder(nn.Module):
                 f"expected {self.hidden_dim}, got {int(context_vector.shape[1])}"
             )
 
-        drug_logits = self.decoder(context_vector)  # [B, D]
-        drug_probs = torch.sigmoid(drug_logits)     # [B, D]
+        x = self.proj(context_vector)           # [B, H]
+        drug_logits = self.fc(x)                # [B, D] raw pre-sigmoid logits
+        drug_probs = torch.sigmoid(drug_logits) # [B, D] probabilities for metrics/thresholding
         return {
             "drug_logits": drug_logits,
             "drug_probs": drug_probs,

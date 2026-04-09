@@ -26,6 +26,15 @@ def _write_csv_gz(path: Path, rows: list[dict[str, object]], fieldnames: list[st
             writer.writerow(row)
 
 
+def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def _write_config(project_root: Path, *, spark_enabled: bool = True) -> Path:
     config_path = project_root / "configs" / "data.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,6 +91,7 @@ def _build_mock_project(tmp_path: Path) -> Path:
     project_root = tmp_path / "mini_project"
     raw_hosp = project_root / "data" / "raw" / "hosp"
     raw_icu = project_root / "data" / "raw" / "icu"
+    raw_ddi = project_root / "data" / "raw" / "ddi"
 
     _write_csv_gz(
         raw_hosp / "patients.csv.gz",
@@ -150,24 +160,69 @@ def _build_mock_project(tmp_path: Path) -> Path:
         [{"itemid": 220045, "label": "Heart Rate", "abbreviation": "HR", "linksto": "chartevents", "category": "Routine Vital Signs", "unitname": "bpm", "param_type": "Numeric", "lownormalvalue": 60, "highnormalvalue": 100}],
         ["itemid", "label", "abbreviation", "linksto", "category", "unitname", "param_type", "lownormalvalue", "highnormalvalue"],
     )
+    prescription_rows = [
+        {"subject_id": 1, "hadm_id": 11, "pharmacy_id": index, "poe_id": f"p_asp_{index}", "poe_seq": 1, "order_provider_id": "A", "starttime": "2020-01-01 08:00:00", "stoptime": "2020-01-01 20:00:00", "drug_type": "MAIN", "drug": "Aspirin", "formulary_drug_cd": "ASP100", "gsn": "", "ndc": "", "prod_strength": "", "form_rx": "", "dose_val_rx": "", "dose_unit_rx": "", "form_val_disp": "", "form_unit_disp": "", "doses_per_24_hrs": "", "route": "PO"}
+        for index in range(1, 10)
+    ]
+    prescription_rows.extend(
+        [
+            {"subject_id": 1, "hadm_id": 11, "pharmacy_id": 101, "poe_id": "p_art_1", "poe_seq": 1, "order_provider_id": "A", "starttime": "2020-01-01 10:00:00", "stoptime": "2020-01-01 10:30:00", "drug_type": "MAIN", "drug": "NS Flush", "formulary_drug_cd": "", "gsn": "", "ndc": "", "prod_strength": "", "form_rx": "", "dose_val_rx": "", "dose_unit_rx": "", "form_val_disp": "", "form_unit_disp": "", "doses_per_24_hrs": "", "route": "IV"},
+            {"subject_id": 1, "hadm_id": 11, "pharmacy_id": 102, "poe_id": "p_art_2", "poe_seq": 1, "order_provider_id": "A", "starttime": "2020-01-01 11:00:00", "stoptime": "2020-01-01 11:30:00", "drug_type": "MAIN", "drug": "Sterile Water", "formulary_drug_cd": "", "gsn": "", "ndc": "", "prod_strength": "", "form_rx": "", "dose_val_rx": "", "dose_unit_rx": "", "form_val_disp": "", "form_unit_disp": "", "doses_per_24_hrs": "", "route": "IV"},
+            {"subject_id": 1, "hadm_id": 11, "pharmacy_id": 103, "poe_id": "p_unknown", "poe_seq": 1, "order_provider_id": "A", "starttime": "2020-01-01 12:00:00", "stoptime": "2020-01-01 12:30:00", "drug_type": "MAIN", "drug": "MysteryDrug", "formulary_drug_cd": "", "gsn": "", "ndc": "", "prod_strength": "", "form_rx": "", "dose_val_rx": "", "dose_unit_rx": "", "form_val_disp": "", "form_unit_disp": "", "doses_per_24_hrs": "", "route": "PO"},
+            {"subject_id": 2, "hadm_id": 22, "pharmacy_id": 201, "poe_id": "p_hep", "poe_seq": 1, "order_provider_id": "B", "starttime": "2020-01-02 09:00:00", "stoptime": "2020-01-02 20:00:00", "drug_type": "MAIN", "drug": "Heparin", "formulary_drug_cd": "HEP5000", "gsn": "", "ndc": "", "prod_strength": "", "form_rx": "", "dose_val_rx": "", "dose_unit_rx": "", "form_val_disp": "", "form_unit_disp": "", "doses_per_24_hrs": "", "route": "IV"},
+        ]
+    )
     _write_csv_gz(
         raw_hosp / "prescriptions.csv.gz",
-        [
-            {"subject_id": 1, "hadm_id": 11, "pharmacy_id": 1, "poe_id": "p1", "poe_seq": 1, "order_provider_id": "A", "starttime": "2020-01-01 08:00:00", "stoptime": "2020-01-01 20:00:00", "drug_type": "MAIN", "drug": "Aspirin", "formulary_drug_cd": "ASP100", "gsn": "", "ndc": "", "prod_strength": "", "form_rx": "", "dose_val_rx": "", "dose_unit_rx": "", "form_val_disp": "", "form_unit_disp": "", "doses_per_24_hrs": "", "route": "PO"},
-            {"subject_id": 2, "hadm_id": 22, "pharmacy_id": 2, "poe_id": "p2", "poe_seq": 1, "order_provider_id": "B", "starttime": "2020-01-02 09:00:00", "stoptime": "2020-01-02 20:00:00", "drug_type": "MAIN", "drug": "Heparin", "formulary_drug_cd": "HEP5000", "gsn": "", "ndc": "", "prod_strength": "", "form_rx": "", "dose_val_rx": "", "dose_unit_rx": "", "form_val_disp": "", "form_unit_disp": "", "doses_per_24_hrs": "", "route": "IV"},
-        ],
+        prescription_rows,
         ["subject_id", "hadm_id", "pharmacy_id", "poe_id", "poe_seq", "order_provider_id", "starttime", "stoptime", "drug_type", "drug", "formulary_drug_cd", "gsn", "ndc", "prod_strength", "form_rx", "dose_val_rx", "dose_unit_rx", "form_val_disp", "form_unit_disp", "doses_per_24_hrs", "route"],
+    )
+    emar_rows = [
+        {"subject_id": 1, "hadm_id": 11, "emar_id": f"e_asp_{index}", "emar_seq": index, "poe_id": f"p_asp_{index}", "pharmacy_id": index, "enter_provider_id": "", "charttime": "2020-01-01 08:00:00", "medication": "Aspirin", "event_txt": "Administered", "scheduletime": "2020-01-01 08:00:00", "storetime": "2020-01-01 08:05:00"}
+        for index in range(1, 3)
+    ]
+    emar_rows.extend(
+        [
+            {"subject_id": 1, "hadm_id": 11, "emar_id": "e_art_1", "emar_seq": 100, "poe_id": "p_art_1", "pharmacy_id": 101, "enter_provider_id": "", "charttime": "2020-01-01 10:00:00", "medication": "NS Flush", "event_txt": "Administered", "scheduletime": "2020-01-01 10:00:00", "storetime": "2020-01-01 10:05:00"},
+            {"subject_id": 1, "hadm_id": 11, "emar_id": "e_unknown", "emar_seq": 101, "poe_id": "p_unknown", "pharmacy_id": 103, "enter_provider_id": "", "charttime": "2020-01-01 12:00:00", "medication": "MysteryDrug", "event_txt": "Administered", "scheduletime": "2020-01-01 12:00:00", "storetime": "2020-01-01 12:05:00"},
+        ]
     )
     _write_csv_gz(
         raw_hosp / "emar.csv.gz",
-        [{"subject_id": 1, "hadm_id": 11, "emar_id": "e1", "emar_seq": 1, "poe_id": "p1", "pharmacy_id": 1, "enter_provider_id": "", "charttime": "2020-01-01 08:00:00", "medication": "Aspirin", "event_txt": "Administered", "scheduletime": "2020-01-01 08:00:00", "storetime": "2020-01-01 08:05:00"}],
+        emar_rows,
         ["subject_id", "hadm_id", "emar_id", "emar_seq", "poe_id", "pharmacy_id", "enter_provider_id", "charttime", "medication", "event_txt", "scheduletime", "storetime"],
     )
+    pharmacy_rows = [
+        {"subject_id": 2, "hadm_id": 22, "pharmacy_id": 201, "poe_id": "p_hep", "starttime": "2020-01-02 09:00:00", "stoptime": "2020-01-02 20:00:00", "medication": "Heparin", "proc_type": "Unit Dose", "status": "Active", "entertime": "2020-01-02 08:30:00", "verifiedtime": "2020-01-02 08:45:00", "route": "IV", "frequency": "BID", "disp_sched": "", "infusion_type": "", "sliding_scale": "", "lockout_interval": "", "basal_rate": "", "one_hr_max": "", "doses_per_24_hrs": "", "duration": "", "duration_interval": "", "expiration_value": "", "expiration_unit": "", "expirationdate": "", "dispensation": "", "fill_quantity": ""}
+    ]
     _write_csv_gz(
         raw_hosp / "pharmacy.csv.gz",
-        [{"subject_id": 2, "hadm_id": 22, "pharmacy_id": 2, "poe_id": "p2", "starttime": "2020-01-02 09:00:00", "stoptime": "2020-01-02 20:00:00", "medication": "Heparin", "proc_type": "Unit Dose", "status": "Active", "entertime": "2020-01-02 08:30:00", "verifiedtime": "2020-01-02 08:45:00", "route": "IV", "frequency": "BID", "disp_sched": "", "infusion_type": "", "sliding_scale": "", "lockout_interval": "", "basal_rate": "", "one_hr_max": "", "doses_per_24_hrs": "", "duration": "", "duration_interval": "", "expiration_value": "", "expiration_unit": "", "expirationdate": "", "dispensation": "", "fill_quantity": ""}],
+        pharmacy_rows,
         ["subject_id", "hadm_id", "pharmacy_id", "poe_id", "starttime", "stoptime", "medication", "proc_type", "status", "entertime", "verifiedtime", "route", "frequency", "disp_sched", "infusion_type", "sliding_scale", "lockout_interval", "basal_rate", "one_hr_max", "doses_per_24_hrs", "duration", "duration_interval", "expiration_value", "expiration_unit", "expirationdate", "dispensation", "fill_quantity"],
     )
+    _write_csv(
+        raw_ddi / "RXCUI2atc4.csv",
+        [
+            {"rxcui": "111", "atc4": "N02BA"},
+            {"rxcui": "222", "atc4": "B01AB"},
+        ],
+        ["rxcui", "atc4"],
+    )
+    _write_csv(
+        raw_ddi / "drug-atc.csv",
+        [
+            {"cid": "1", "atc4": "N02BA", "drug_name": "Aspirin"},
+            {"cid": "2", "atc4": "B01AB", "drug_name": "Heparin"},
+        ],
+        ["cid", "atc4", "drug_name"],
+    )
+    _write_csv(
+        raw_ddi / "drug-DDI.csv",
+        [{"cid1": "1", "cid2": "2"}],
+        ["cid1", "cid2"],
+    )
+    raw_ddi.mkdir(parents=True, exist_ok=True)
+    (raw_ddi / "ndc2RXCUI.txt").write_text("{'00000000001': '111', '00000000002': '222'}", encoding="utf-8")
     return project_root
 
 
@@ -196,6 +251,21 @@ def test_build_vocab_auto_stages_when_spark_enabled(tmp_path: Path) -> None:
     build_vocab(config_path)
     assert (project_root / "data" / "interim" / "spark_cache" / "cache_manifest.json").exists()
     assert (project_root / "data" / "interim" / "vocab" / "diagnosis_vocab.json").exists()
+
+
+def test_build_vocab_filters_drug_tokens_by_atc4_train_frequency_and_artifacts(tmp_path: Path) -> None:
+    project_root = _build_mock_project(tmp_path)
+    config_path = _write_config(project_root, spark_enabled=False)
+
+    build_cohort(config_path)
+    build_vocab(config_path)
+
+    drug_vocab = read_json(project_root / "data" / "interim" / "vocab" / "drug_vocab.json")
+    assert drug_vocab["idx_to_token"] == ["PAD", "UNK", "NAME:ASPIRIN"]
+    assert "NAME:HEPARIN" not in drug_vocab["token_to_idx"]
+    assert "NAME:NS_FLUSH" not in drug_vocab["token_to_idx"]
+    assert "NAME:STERILE_WATER" not in drug_vocab["token_to_idx"]
+    assert "NAME:MYSTERYDRUG" not in drug_vocab["token_to_idx"]
 
 
 def test_data_pipeline_builders_with_spark_cache(tmp_path: Path) -> None:
